@@ -2,13 +2,14 @@ package com.typesafe.sbt.rjs
 
 import sbt._
 import sbt.Keys._
-import com.typesafe.sbt.web.SbtWeb
+import com.typesafe.sbt.web._
 import com.typesafe.sbt.web.SbtWeb.autoImport.WebJs._
 import com.typesafe.sbt.web.pipeline.Pipeline
 import com.typesafe.sbt.jse.{SbtJsEngine, SbtJsTask}
 import java.nio.charset.Charset
 import scala.collection.immutable.SortedMap
 import java.io.{InputStreamReader, BufferedReader}
+import spray.json._
 
 object Import {
 
@@ -19,6 +20,7 @@ object Import {
     val appDir = SettingKey[File]("rjs-app-dir", "The top level directory that contains your app js files. In effect, this is the source folder that rjs reads from.")
     val baseUrl = TaskKey[String]("rjs-base-url", """The dir relative to the source assets or public folder where js files are housed. Will default to "js", "javascripts" or "." with the latter if the other two cannot be found.""")
     val buildProfile = TaskKey[JS.Object]("rjs-build-profile", "Build profile key -> value settings in addition to the defaults supplied by appBuildProfile. Any settings in here will also replace any defaults.")
+    val buildProfilePath = TaskKey[String]("rjs-build-profile-path", "Path to yet more build profile JSON values to override defaults, available in mappings from previous pipeline steps")
     val buildWriter = TaskKey[JavaScript]("rjs-build-writer", "The project build writer JavaScript that is responsible for writing out source files in rjs.")
     val dir = SettingKey[File]("rjs-dir", "By default, all modules are located relative to this path. In effect this is the target directory for rjs.")
     val generateSourceMaps = SettingKey[Boolean]("rjs-generate-source-maps", "By default, source maps are generated.")
@@ -55,6 +57,7 @@ object SbtRjs extends AutoPlugin {
     appDir := (resourceManaged in rjs).value / "appdir",
     baseUrl := getBaseUrl.value,
     buildProfile := JS.Object.empty,
+    buildProfilePath := "extra.build.js",
     buildWriter := getBuildWriter.value,
     dir := (resourceManaged in rjs).value / "build",
     excludeFilter in rjs := HiddenFileFilter,
@@ -168,6 +171,16 @@ object SbtRjs extends AutoPlugin {
     ).toSeq.map(_._2).distinct
   }
 
+  private def extraBuildProfile(m: Option[PathMapping]): JS.Object = {
+    import SpraySbtJsonConversion._
+    m.collect { case (file, _) if file.exists =>
+      val asSpray = JsonParser(IO.read(file, Utf8))
+      sprayToSbtJson(asSpray)
+    }.filter(_.isInstanceOf[JS.Object])
+    .map(_.asInstanceOf[JS.Object])
+    .getOrElse(JS.Object.empty)
+  }
+
   private def runOptimizer: Def.Initialize[Task[Pipeline.Stage]] = Def.task {
     mappings =>
 
@@ -181,7 +194,9 @@ object SbtRjs extends AutoPlugin {
       )
 
       val targetBuildProfileFile = (resourceManaged in rjs).value / "app.build.js"
-      IO.write(targetBuildProfileFile, appBuildProfile.value.js, Utf8)
+      val targetBuildProfile = appBuildProfile.value ++
+          extraBuildProfile(mappings.find(_._2 == buildProfilePath.value))
+      IO.write(targetBuildProfileFile, targetBuildProfile.js, Utf8)
 
       val cacheDirectory = streams.value.cacheDirectory / rjs.key.label
       val runUpdate = FileFunction.cached(cacheDirectory, FilesInfo.hash) {
@@ -216,4 +231,15 @@ object SbtRjs extends AutoPlugin {
    */
   private def unixPath(p: String): String = p.replace("\\","/")
 
+}
+
+object SpraySbtJsonConversion {
+  def sprayToSbtJson(spray: JsValue): JS[_] = spray match {
+    case a: JsArray => new JS.Array(a.elements.map(sprayToSbtJson))
+    case o: JsObject => new JS.Object(o.fields.mapValues(sprayToSbtJson))
+    case s: JsString => s.value
+    case n: JsNumber => JavaScript(n.value.toString)
+    case b: JsBoolean => b.value
+    case JsNull => JavaScript("null")
+  }
 }
